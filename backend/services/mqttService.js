@@ -24,10 +24,10 @@ function init() {
     client.on('connect', () => {
         console.log('[MQTT] Başarıyla HiveMQ Cloud\'a bağlandı!');
         
-        // ESP32'den gelecek sensör verilerini dinliyoruz
-        client.subscribe('sera/sensor/#', (err) => {
+        // Sensör, durum ve kontrol (manuel) konularına abone oluyoruz
+        client.subscribe(['sera/sensor/#', 'sera/status/#', 'sera/control/#'], (err) => {
             if (!err) {
-                console.log('[MQTT] "sera/sensor/#" konularına abone olundu.');
+                console.log('[MQTT] "sera/#" konularına (sensor, status, control) abone olundu.');
             }
         });
     });
@@ -36,9 +36,21 @@ function init() {
         const msgStr = message.toString();
         console.log(`[MQTT] Yeni Mesaj Alındı -> ${topic}: ${msgStr}`);
         
-        // Örn topic: sera/sensor/sicaklik -> message: 25.4
-        // Burada gelen veriyi ayrıştırıp DB servisine yolluyoruz
-        dbService.saveSensorData(topic, msgStr);
+        // Sensör verisi mi, durum bilgisi mi yoksa kontrol komutu mu?
+        if (topic.startsWith('sera/sensor/')) {
+            dbService.saveSensorData(topic, msgStr);
+        } else if (topic.startsWith('sera/status/') || topic.startsWith('sera/control/')) {
+            const device = topic.split('/').pop();
+            
+            // Eğer mod değişikliği ise
+            if (device === 'mode') {
+                dbService.updateSystemMode(msgStr); // msgStr: 'AUTO' veya 'MANUAL'
+            }
+            // Diğer donanımlar
+            else if(['fan', 'led', 'pump'].includes(device)) {
+                dbService.updateDeviceStatus(device, msgStr);
+            }
+        }
     });
 
     client.on('error', (err) => {
@@ -52,6 +64,10 @@ function sendCommand(device, action) {
     }
     const topic = `sera/control/${device}`;
     client.publish(topic, action);
+    
+    // Verimlilik hesabı için durumu hemen güncelle (Senkronizasyon)
+    dbService.updateDeviceStatus(device, action);
+    
     console.log(`[MQTT] Komut Gönderildi -> ${topic}: ${action}`);
 }
 

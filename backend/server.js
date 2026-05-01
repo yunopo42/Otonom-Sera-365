@@ -1,12 +1,16 @@
 require('dotenv').config();
 const express = require('express');
+const path = require('path');
 const cors = require('cors');
 const mqttService = require('./services/mqttService');
 const dbService = require('./services/dbService');
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '50mb' }));
+
+// dist/ klasörünü statik olarak sun (Frontend HTTP üzerinden çalışsın)
+app.use(express.static(path.join(__dirname, '..', 'dist')));
 
 const PORT = process.env.PORT || 3000;
 
@@ -31,6 +35,11 @@ app.post('/api/control', (req, res) => {
     } catch (err) {
         res.status(500).json({ error: 'Failed to send command' });
     }
+});
+
+// Cihazların güncel durumunu (ON/OFF) ve enerji verilerini dönen API
+app.get('/api/device-status', (req, res) => {
+    res.json(dbService.getDeviceStatus());
 });
 
 // Yapay Zeka (AI) Hastalık Loglama API'si (Resim yükleme dahil)

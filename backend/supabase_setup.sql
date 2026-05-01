@@ -32,3 +32,14 @@ CREATE TABLE public.ai_logs (
 -- 4. ANALİZ İÇİN İNDEKSLER (Performans Optimizasyonu)
 CREATE INDEX idx_sensor_logs_created_at ON public.sensor_logs(created_at);
 CREATE INDEX idx_ai_logs_created_at ON public.ai_logs(created_at);
+
+-- 5. ENDÜSTRİYEL VERİMLİLİK İSTATİSTİKLERİ TABLOSU
+CREATE TABLE public.industrial_stats (
+    id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL,
+    energy_kwh NUMERIC,
+    water_saved_liters NUMERIC,
+    labor_saved_hours NUMERIC,
+    efficiency_score NUMERIC
+);
+ALTER TABLE public.industrial_stats DISABLE ROW LEVEL SECURITY;

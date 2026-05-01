@@ -10,12 +10,29 @@ document.addEventListener("DOMContentLoaded", () => {
     loadTFModel();
     fetchAnalytics(); // Veri madenciliği panelini doldur
     
+    // Uygulama Durumunu Geri Yükle (Hafızadan)
+    restoreAppState();
+
     if (ESP_IP) {
         initLocalESP32();
-    } else {
-        // MQTT WebSocket Entegrasyonu Başlat
-        initMQTT();
     }
+    
+    // MQTT her durumda başlatılmalı (Özellikle Kamera yayını bulut üzerinden geldiği için)
+    initMQTT();
+
+    // Otonom AI Analiz Döngüsü (Her 30 saniyede bir kamera görüntüsünü analiz et)
+    setInterval(() => {
+        const overrideToggle = document.getElementById('override-toggle');
+        if (overrideToggle && overrideToggle.checked) return; // Manuel moddaysa çalışmasın
+
+        const imgEl = document.getElementById('video-stream');
+        if (!imgEl || !imgEl.src || imgEl.src.includes('R0lGODlhAQABAIAAAAAAAP') || imgEl.src.startsWith('blob:')) {
+            return;
+        }
+
+        console.log("Otonom AI Analizi tetiklendi...");
+        predictImage(imgEl);
+    }, 30000);
 });
 
 // Update the Top Header Clock
@@ -125,9 +142,12 @@ function initChart() {
 }
 
 // Toggle Manual Override
-function toggleManualOverride(toggleEl, fromNetwork = false) {
+window.toggleManualOverride = function(toggleEl, fromNetwork = false) {
     const isManual = toggleEl.checked;
     
+    // Modu hafızaya kaydet
+    localStorage.setItem('seraMode', isManual ? 'MANUAL' : 'AUTO');
+
     // Ağdan gelmediyse, benim basışımı tüm cihazlara yay
     if (!fromNetwork && window.mqttClient) {
         window.mqttClient.publish('sera/control/mode', isManual ? 'MANUAL' : 'AUTO', { retain: true });
@@ -156,6 +176,50 @@ function toggleManualOverride(toggleEl, fromNetwork = false) {
     } else {
         addAlert("Otonom Mod Aktif", "Uzman sistem kararları devrede. Röleler otomatik yönetilecek.", "info");
     }
+}
+
+// Uygulama açılışında en son durumu backend'den ve localStorage'dan geri yükle
+function restoreAppState() {
+    console.log("Uygulama durumu geri yükleniyor...");
+    
+    // Cihaz Durumlarını ve Modu Backend'den Çek
+    fetch('/api/device-status')
+        .then(res => res.json())
+        .then(statusMap => {
+            // 1. Modu Geri Yükle (Global Senkronizasyon)
+            const overrideToggle = document.getElementById('override-toggle');
+            if (statusMap.systemMode === 'MANUAL') {
+                overrideToggle.checked = true;
+                toggleManualOverride(overrideToggle, true);
+            } else {
+                overrideToggle.checked = false;
+                toggleManualOverride(overrideToggle, true);
+            }
+
+            // 2. Röle Durumlarını Geri Yükle
+            for (const device in statusMap) {
+                if(device === 'systemMode') continue;
+                
+                const isChecked = statusMap[device].state === 'ON';
+                const toggleId = `relay-${device}`;
+                const toggleEl = document.getElementById(toggleId);
+                
+                if (toggleEl) {
+                    toggleEl.checked = isChecked;
+                    updateRelayUI(toggleId, isChecked);
+                }
+            }
+        })
+        .catch(err => {
+            console.warn("Başlangıç durumları backend'den alınamadı, yerel hafıza deneniyor:", err);
+            // Fallback: Yerel hafıza (offline durumlar için)
+            const savedMode = localStorage.getItem('seraMode');
+            const overrideToggle = document.getElementById('override-toggle');
+            if (savedMode === 'MANUAL') {
+                overrideToggle.checked = true;
+                toggleManualOverride(overrideToggle, true);
+            }
+        });
 }
 
 function updateRelayUI(id, isChecked) {
@@ -304,47 +368,61 @@ function initMQTT() {
     });
 
     client.on('message', function (topic, message) {
-        if (topic === 'sera/kamera') {
-            // file:/// ile açılan sayfalarda güvenliğe takılmaması için Blob yerine Evrensel Base64 Yöntemi
+        console.log("MQTT Mesaj Geldi -> Konu:", topic, "Boyut:", message.length);
+
+        // 1. KAMERA GÖRÜNTÜSÜ (Esnek Konu Yakalama)
+        if (topic === 'sera/kamera' || topic === 'sera/camera') {
             try {
-                let bytes = new Uint8Array(message);
+                const bytes = new Uint8Array(message);
                 let binary = '';
-                for (let i = 0; i < bytes.length; i++) {
+                const len = bytes.byteLength;
+                for (let i = 0; i < len; i++) {
                     binary += String.fromCharCode(bytes[i]);
                 }
+                const base64String = window.btoa(binary);
+                
                 const imgEl = document.getElementById('video-stream');
                 if (imgEl) {
                     imgEl.style.display = 'block';
                     const fallbackEl = document.getElementById('stream-fallback');
                     if (fallbackEl) fallbackEl.style.display = 'none';
-                    imgEl.src = 'data:image/jpeg;base64,' + window.btoa(binary);
+                    imgEl.src = 'data:image/jpeg;base64,' + base64String;
+                    console.log("Kamera görüntüsü başarıyla güncellendi.");
                 }
             } catch(e) {
-                console.log("Kamera okuma hatasi:", e);
+                console.error("Kamera verisi isleme hatasi:", e);
             }
             return;
         }
 
         const payload = message.toString();
         const parts = topic.split('/');
-        const endpoint = parts[2]; // 'sicaklik', 'nem', 'fan', vb.
+        const category = parts[1]; // 'sensor', 'control' veya 'status'
+        const endpoint = parts[2]; // 'sicaklik', 'fan', 'mode' vb.
 
-        if (topic === 'sera/control/mode') {
-            const overrideEl = document.getElementById('override-toggle');
-            if (overrideEl) {
+        // 2. MOD VE CİHAZ SENKRONİZASYONU
+        if (category === 'control' || category === 'status') {
+            if (endpoint === 'mode') {
+                const overrideEl = document.getElementById('override-toggle');
                 const isManual = (payload === 'MANUAL');
-                if (overrideEl.checked !== isManual) {
+                if (overrideEl && overrideEl.checked !== isManual) {
                     overrideEl.checked = isManual;
-                    toggleManualOverride(overrideEl, true); // fromNetwork = true
+                    toggleManualOverride(overrideEl, true);
+                }
+            } else if (['fan', 'led', 'pump'].includes(endpoint)) {
+                const isON = (payload === 'ON');
+                const toggleId = `relay-${endpoint}`;
+                const toggleEl = document.getElementById(toggleId);
+                if (toggleEl && toggleEl.checked !== isON) {
+                    toggleEl.checked = isON;
+                    updateRelayUI(toggleId, isON);
                 }
             }
-            return;
         }
 
-        if (topic.includes('sensor')) {
-            updateSensorUI(endpoint, parseFloat(payload));
-        } else if (topic.includes('control')) {
-            updateControlUI(endpoint, payload);
+        // 3. SENSÖR VERİLERİ
+        if (category === 'sensor') {
+            updateSensorUI(endpoint, payload);
         }
     });
 
@@ -355,33 +433,37 @@ function initMQTT() {
 // CANLI UI GÜNCELLEMELERİ
 // -------------------------
 function updateSensorUI(type, value) {
+    // MQTT string olarak gönderir, parseFloat ile sayıya çevir
+    const numVal = parseFloat(value);
+    if (isNaN(numVal)) return;
+
     if (type === 'sicaklik') {
-        document.getElementById('val-temp').innerText = value.toFixed(1);
-        updateMainChartData(0, value); // 0. Dataset Sıcaklık
-        updateCircularProgress('.circular-chart.orange .circle', value, 50); 
+        document.getElementById('val-temp').innerText = numVal.toFixed(1);
+        updateMainChartData(0, numVal); // 0. Dataset Sıcaklık
+        updateCircularProgress('.circular-chart.orange .circle', numVal, 50); 
     } 
     else if (type === 'nem') {
-        document.getElementById('val-hum').innerText = Math.round(value);
-        updateMainChartData(1, value); // 1. Dataset Nem
-        updateCircularProgress('.circular-chart.blue .circle', value, 100);
+        document.getElementById('val-hum').innerText = Math.round(numVal);
+        updateMainChartData(1, numVal); // 1. Dataset Nem
+        updateCircularProgress('.circular-chart.blue .circle', numVal, 100);
     }
     else if (type === 'isik') {
-        document.getElementById('val-light').innerText = Math.round(value);
-        updateCircularProgress('.circular-chart.yellow .circle', value, 4095); 
+        document.getElementById('val-light').innerText = Math.round(numVal);
+        updateCircularProgress('.circular-chart.yellow .circle', numVal, 4095); 
     }
     else if (type === 'toprak') {
         const soilEl = document.getElementById('val-soil');
-        if(soilEl) soilEl.innerText = Math.round(value);
+        if(soilEl) soilEl.innerText = Math.round(numVal);
         
         // 4095 kuru, 0 çok ıslak. Ters orantı ile nem yüzdesi gibi gösterelim (sadece grafik için)
         // Ya da direkt değeri 4095'e bölerek dolduralım:
-        updateCircularProgress('.circular-chart.green .circle', value, 4095);
+        updateCircularProgress('.circular-chart.green .circle', numVal, 4095);
     }
     else if (type === 'yagmur') {
         const rainEl = document.getElementById('val-rain');
-        if(rainEl) rainEl.innerText = Math.round(value);
+        if(rainEl) rainEl.innerText = Math.round(numVal);
         
-        updateCircularProgress('.circular-chart.cyan .circle', value, 4095);
+        updateCircularProgress('.circular-chart.cyan .circle', numVal, 4095);
     }
 }
 
@@ -499,6 +581,18 @@ function updateChartTheme(theme) {
 // ==========================================
 // KAMERA KONTROLLERİ (FOTOĞRAF ÇEK / YÜKLE)
 // ==========================================
+// Manuel Analiz Tetikleyici (Butona basıldığında)
+window.runManualAnalysis = function() {
+    const imgEl = document.getElementById('video-stream');
+    if (!imgEl || !imgEl.src || imgEl.src.includes('R0lGODlhAQABAIAAAAAAAP')) {
+        addAlert("Hata", "Henüz bir görüntü ulaşmadı! Lütfen kameranın bağlanmasını bekleyin.", "danger");
+        return;
+    }
+    
+    addAlert("Analiz Başladı", "Görüntü yapay zeka modeline gönderiliyor...", "info");
+    predictImage(imgEl);
+}
+
 window.capturePhoto = function() {
     const imgEl = document.getElementById('video-stream');
     // Eğer resim henüz yüklenmediyse hata ver:
@@ -626,13 +720,23 @@ async function predictImage(imgElement) {
         // Veritabanı ve Veri Madenciliği İçin Backend'e Gönder (Resim Dahil)
         try {
             const canvas = document.createElement("canvas");
-            canvas.width = imgElement.naturalWidth || imgElement.width || 224;
-            canvas.height = imgElement.naturalHeight || imgElement.height || 224;
-            const ctx = canvas.getContext("2d");
-            ctx.drawImage(imgElement, 0, 0, canvas.width, canvas.height);
-            const base64Image = canvas.toDataURL("image/jpeg", 0.7); // Optimize edilmiş boyut
+            // Resmi çok büyük göndermemek için max 640px ile sınırla
+            const MAX_SIZE = 640;
+            let width = imgElement.naturalWidth || imgElement.width || 224;
+            let height = imgElement.naturalHeight || imgElement.height || 224;
             
-            fetch('http://localhost:3000/api/ai-log', {
+            if (width > MAX_SIZE) {
+                height *= MAX_SIZE / width;
+                width = MAX_SIZE;
+            }
+            
+            canvas.width = width;
+            canvas.height = height;
+            const ctx = canvas.getContext("2d");
+            ctx.drawImage(imgElement, 0, 0, width, height);
+            const base64Image = canvas.toDataURL("image/jpeg", 0.6); // Kaliteyi %60 yaparak boyutu iyice düşür
+            
+            fetch('/api/ai-log', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
@@ -658,7 +762,7 @@ function fetchAnalytics() {
     const icon = document.querySelector('.analytics-header .fa-sync');
     if(icon) icon.classList.add('fa-spin');
 
-    fetch('http://localhost:3000/api/analytics')
+    fetch('/api/analytics')
         .then(res => res.json())
         .then(data => {
             if (data.error) {
@@ -668,8 +772,24 @@ function fetchAnalytics() {
             document.getElementById('stat-avg-temp').textContent = `${data.average_temperature} °C`;
             document.getElementById('stat-avg-hum').textContent = `${data.average_humidity} %`;
             document.getElementById('stat-insight').textContent = data.insight;
+            
+            // Endüstriyel Metrikleri Güncelle
+            if (data.industrial_metrics) {
+                document.getElementById('ind-energy').textContent = data.industrial_metrics.total_energy_kwh;
+                document.getElementById('ind-water').textContent = data.industrial_metrics.water_saved_liters;
+                document.getElementById('ind-labor').textContent = data.industrial_metrics.labor_saved_hours;
+                document.getElementById('ind-score').textContent = data.industrial_metrics.efficiency_score;
+            }
+
+            // Veritabanı bağlı LED'ini yak
+            const dbLed = document.getElementById('led-db');
+            if(dbLed) dbLed.className = "led status-healthy";
         })
-        .catch(err => console.error("Analiz verisi alınamadı:", err))
+        .catch(err => {
+            console.error("Analiz verisi alınamadı:", err);
+            const dbLed = document.getElementById('led-db');
+            if(dbLed) dbLed.className = "led"; // Hata durumunda griye çek
+        })
         .finally(() => {
             if(icon) icon.classList.remove('fa-spin');
         });
@@ -808,23 +928,4 @@ function setRelayAutonomous(device, state) {
         .catch(e => console.error("Otonom Komut Hatası:", e));
 }
 
-// Sayfa yüklendiğinde modeli belleğe al
-window.addEventListener('DOMContentLoaded', () => {
-    loadTFModel();
-    
-    // Otonom AI Analiz Döngüsü (Her 30 saniyede bir)
-    setInterval(() => {
-        const overrideToggle = document.getElementById('override-toggle');
-        // Eğer manuel moddaysa (checked) otonom AI çalışmasın
-        if (overrideToggle && overrideToggle.checked) return;
-
-        const imgEl = document.getElementById('video-stream');
-        // Görüntü yoksa veya kullanıcı kendi fotoğraf yüklediyse ('blob:') analiz etme
-        if (!imgEl || !imgEl.src || imgEl.src.includes('R0lGODlhAQABAIAAAAAAAP') || imgEl.src.startsWith('blob:')) {
-            return;
-        }
-
-        console.log("Otonom AI Analizi tetiklendi...");
-        predictImage(imgEl);
-    }, 30000); // 30 saniye
-});
+// Otonom AI Analiz Döngüsü artık ana DOMContentLoaded bloğuna taşındı (satır 24-35).
