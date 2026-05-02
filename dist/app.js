@@ -183,7 +183,7 @@ function restoreAppState() {
     console.log("Uygulama durumu geri yükleniyor...");
     
     // Cihaz Durumlarını ve Modu Backend'den Çek
-    fetch('/api/device-status')
+    fetch('https://otonom-sera-365.onrender.com/api/device-status')
         .then(res => res.json())
         .then(statusMap => {
             // 1. Modu Geri Yükle (Global Senkronizasyon)
@@ -736,7 +736,7 @@ async function predictImage(imgElement) {
             ctx.drawImage(imgElement, 0, 0, width, height);
             const base64Image = canvas.toDataURL("image/jpeg", 0.6); // Kaliteyi %60 yaparak boyutu iyice düşür
             
-            fetch('/api/ai-log', {
+            fetch('https://otonom-sera-365.onrender.com/api/ai-log', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
@@ -762,7 +762,7 @@ function fetchAnalytics() {
     const icon = document.querySelector('.analytics-header .fa-sync');
     if(icon) icon.classList.add('fa-spin');
 
-    fetch('/api/analytics')
+    fetch('https://otonom-sera-365.onrender.com/api/analytics')
         .then(res => res.json())
         .then(data => {
             if (data.error) {
