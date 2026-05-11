@@ -2,21 +2,37 @@
 
 // --- AYARLAR ---
 // ESP32'nin bağlandığı IP adresi:
-const ESP_IP = "10.73.82.223"; 
+const ESP_IP = "10.73.82.223";
+
+// --- SUPABASE AYARLARI ---
+const SUPABASE_URL = "https://jtlnqbkigtcgnvmouwit.supabase.co";
+const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imp0bG5xYmtpZ3RjZ252bW91d2l0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzY1MTcwMzUsImV4cCI6MjA5MjA5MzAzNX0.J8wYFU-6VAH_0Mp2GOHafJTj-1xQWT92_Dsgdp9Er1Y"; // <-- BURAYA DASHBOARD'DAN ALDIĞINIZ ANON KEY'İ YAPIŞTIRIN
+let supabaseClient = null;
+
+if (typeof supabase !== 'undefined') {
+    supabaseClient = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+}
 
 document.addEventListener("DOMContentLoaded", () => {
     initClock();
     initChart();
     loadTFModel();
     fetchAnalytics(); // Veri madenciliği panelini doldur
-    
+
     // Uygulama Durumunu Geri Yükle (Hafızadan)
     restoreAppState();
 
-    if (ESP_IP) {
+    // Bulut ortamında (Netlify vb.) miyiz yoksa lokalde (localhost/file) miyiz kontrol et
+    window.isCloudEnvironment = window.location.hostname !== 'localhost' &&
+        window.location.hostname !== '127.0.0.1' &&
+        window.location.protocol !== 'file:';
+
+    if (ESP_IP && !window.isCloudEnvironment) {
         initLocalESP32();
+    } else if (window.isCloudEnvironment) {
+        console.log("Bulut ortamı algılandı. Yerel ESP32 (HTTP) istekleri devre dışı bırakıldı, sadece MQTT kullanılacak.");
     }
-    
+
     // MQTT her durumda başlatılmalı (Özellikle Kamera yayını bulut üzerinden geldiği için)
     initMQTT();
 
@@ -48,16 +64,16 @@ function initClock() {
 let mainChart;
 function initChart() {
     const ctx = document.getElementById('mainChart').getContext('2d');
-    
+
     // Chart Defaults for Dark Theme
     Chart.defaults.color = "rgba(255, 255, 255, 0.5)";
     Chart.defaults.font.family = "'Inter', sans-serif";
-    
+
     // Mock Data for 24h
-    const labels = Array.from({length: 12}, (_, i) => `${i*2}:00`);
+    const labels = Array.from({ length: 12 }, (_, i) => `${i * 2}:00`);
     const tempData = [22, 21.5, 21, 20.5, 20, 21, 22.5, 24, 25.5, 26, 25, 24.5];
     const humData = [60, 62, 65, 68, 70, 69, 65, 60, 55, 52, 58, 62];
-    
+
     mainChart = new Chart(ctx, {
         type: 'line',
         data: {
@@ -142,36 +158,41 @@ function initChart() {
 }
 
 // Toggle Manual Override
-window.toggleManualOverride = function(toggleEl, fromNetwork = false) {
+window.toggleManualOverride = function (toggleEl, fromNetwork = false) {
     const isManual = toggleEl.checked;
-    
+
     // Modu hafızaya kaydet
     localStorage.setItem('seraMode', isManual ? 'MANUAL' : 'AUTO');
 
     // Ağdan gelmediyse, benim basışımı tüm cihazlara yay
-    if (!fromNetwork && window.mqttClient) {
-        window.mqttClient.publish('sera/control/mode', isManual ? 'MANUAL' : 'AUTO', { retain: true });
+    if (!fromNetwork) {
+        if (window.mqttClient) {
+            window.mqttClient.publish('sera/control/mode', isManual ? 'MANUAL' : 'AUTO', { retain: true });
+        }
+        if (supabaseClient && SUPABASE_ANON_KEY !== "BURAYA_SUPABASE_ANON_KEY_GELECEK") {
+            supabaseClient.from('device_states').update({ state: isManual ? 'MANUAL' : 'AUTO' }).eq('device', 'systemMode').then();
+        }
     }
-    
+
     // Get all override controls (relay checkboxes)
     const relayToggles = document.querySelectorAll('.override-control input[type="checkbox"]');
-    
+
     relayToggles.forEach(relay => {
         // In manual mode, user can control them. In autonomous mode, they are disabled (controlled by AI/Code)
         relay.disabled = !isManual;
-        
+
         // Add event listeners if manual, to update UI texts dynamically
-        if(isManual) {
-            relay.onchange = function() {
+        if (isManual) {
+            relay.onchange = function () {
                 updateRelayUI(this.id, this.checked);
             }
         } else {
             relay.onchange = null;
         }
     });
-    
+
     // Visual feedback
-    if(isManual) {
+    if (isManual) {
         addAlert("Manuel Kontrol Aktif", "Sistem otonom kararları devre dışı bırakıldı. Kontrol sizde.", "warning");
     } else {
         addAlert("Otonom Mod Aktif", "Uzman sistem kararları devrede. Röleler otomatik yönetilecek.", "info");
@@ -181,56 +202,123 @@ window.toggleManualOverride = function(toggleEl, fromNetwork = false) {
 // Uygulama açılışında en son durumu backend'den ve localStorage'dan geri yükle
 function restoreAppState() {
     console.log("Uygulama durumu geri yükleniyor...");
-    
-    // Cihaz Durumlarını ve Modu Backend'den Çek
-    fetch('https://otonom-sera-365.onrender.com/api/device-status')
-        .then(res => res.json())
-        .then(statusMap => {
-            // 1. Modu Geri Yükle (Global Senkronizasyon)
-            const overrideToggle = document.getElementById('override-toggle');
-            if (statusMap.systemMode === 'MANUAL') {
-                overrideToggle.checked = true;
-                toggleManualOverride(overrideToggle, true);
-            } else {
-                overrideToggle.checked = false;
-                toggleManualOverride(overrideToggle, true);
-            }
 
-            // 2. Röle Durumlarını Geri Yükle
-            for (const device in statusMap) {
-                if(device === 'systemMode') continue;
-                
-                const isChecked = statusMap[device].state === 'ON';
+    // Eğer Supabase yapılandırıldıysa doğrudan Supabase'den çek
+    if (supabaseClient && SUPABASE_ANON_KEY !== "BURAYA_SUPABASE_ANON_KEY_GELECEK") {
+        supabaseClient
+            .from('device_states')
+            .select('*')
+            .then(({ data, error }) => {
+                if (error || !data) {
+                    console.error("Supabase'den durum alınamadı:", error);
+                    return;
+                }
+
+                let statusMap = {};
+                data.forEach(item => {
+                    statusMap[item.device] = { state: item.state };
+                });
+
+                // 1. Modu Geri Yükle
+                const overrideToggle = document.getElementById('override-toggle');
+                if (statusMap['systemMode'] && statusMap['systemMode'].state === 'MANUAL') {
+                    overrideToggle.checked = true;
+                    toggleManualOverride(overrideToggle, true);
+                } else {
+                    overrideToggle.checked = false;
+                    toggleManualOverride(overrideToggle, true);
+                }
+
+                // 2. Röle Durumlarını Geri Yükle
+                ['fan', 'pump', 'led'].forEach(device => {
+                    if (statusMap[device]) {
+                        const isChecked = statusMap[device].state === 'ON';
+                        const toggleId = `relay-${device}`;
+                        const toggleEl = document.getElementById(toggleId);
+                        if (toggleEl) {
+                            toggleEl.checked = isChecked;
+                            updateRelayUI(toggleId, isChecked);
+                        }
+                    }
+                });
+
+                // Supabase Realtime'ı başlat (Diğer cihazlardan anlık güncellemeleri dinle)
+                initSupabaseRealtime();
+            });
+    } else {
+        // Eski yöntem (Render Backend'den çek, Supabase KEY eklenene kadar çalışır)
+        fetch('https://otonom-sera-365.onrender.com/api/device-status')
+            .then(res => res.json())
+            .then(statusMap => {
+                const overrideToggle = document.getElementById('override-toggle');
+                if (statusMap.systemMode === 'MANUAL') {
+                    overrideToggle.checked = true;
+                    toggleManualOverride(overrideToggle, true);
+                } else {
+                    overrideToggle.checked = false;
+                    toggleManualOverride(overrideToggle, true);
+                }
+
+                for (const device in statusMap) {
+                    if (device === 'systemMode') continue;
+                    const isChecked = statusMap[device].state === 'ON';
+                    const toggleId = `relay-${device}`;
+                    const toggleEl = document.getElementById(toggleId);
+                    if (toggleEl) {
+                        toggleEl.checked = isChecked;
+                        updateRelayUI(toggleId, isChecked);
+                    }
+                }
+            })
+            .catch(err => {
+                console.warn("Başlangıç durumları backend'den alınamadı, yerel hafıza deneniyor:", err);
+                const savedMode = localStorage.getItem('seraMode');
+                const overrideToggle = document.getElementById('override-toggle');
+                if (savedMode === 'MANUAL') {
+                    overrideToggle.checked = true;
+                    toggleManualOverride(overrideToggle, true);
+                }
+            });
+    }
+}
+
+function initSupabaseRealtime() {
+    supabaseClient
+        .channel('device-updates')
+        .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'device_states' }, payload => {
+            console.log("Supabase Realtime Güncellemesi:", payload.new);
+            const device = payload.new.device;
+            const state = payload.new.state;
+
+            if (device === 'systemMode') {
+                const overrideToggle = document.getElementById('override-toggle');
+                const isManual = (state === 'MANUAL');
+                if (overrideToggle && overrideToggle.checked !== isManual) {
+                    overrideToggle.checked = isManual;
+                    toggleManualOverride(overrideToggle, true); // true = fromNetwork (sonsuz döngüyü engeller)
+                }
+            } else if (['fan', 'pump', 'led'].includes(device)) {
+                const isChecked = (state === 'ON');
                 const toggleId = `relay-${device}`;
                 const toggleEl = document.getElementById(toggleId);
-                
-                if (toggleEl) {
+                if (toggleEl && toggleEl.checked !== isChecked) {
                     toggleEl.checked = isChecked;
                     updateRelayUI(toggleId, isChecked);
                 }
             }
         })
-        .catch(err => {
-            console.warn("Başlangıç durumları backend'den alınamadı, yerel hafıza deneniyor:", err);
-            // Fallback: Yerel hafıza (offline durumlar için)
-            const savedMode = localStorage.getItem('seraMode');
-            const overrideToggle = document.getElementById('override-toggle');
-            if (savedMode === 'MANUAL') {
-                overrideToggle.checked = true;
-                toggleManualOverride(overrideToggle, true);
-            }
-        });
+        .subscribe();
 }
 
 function updateRelayUI(id, isChecked) {
     let statusId = "";
-    if(id === "relay-fan") statusId = "status-fan";
-    if(id === "relay-led") statusId = "status-led";
-    if(id === "relay-pump") statusId = "status-pump";
-    
+    if (id === "relay-fan") statusId = "status-fan";
+    if (id === "relay-led") statusId = "status-led";
+    if (id === "relay-pump") statusId = "status-pump";
+
     const statusEl = document.getElementById(statusId);
-    if(statusEl) {
-        if(isChecked) {
+    if (statusEl) {
+        if (isChecked) {
             statusEl.textContent = "Şu anda ÇALIŞIYOR";
             statusEl.className = "status-text active";
         } else {
@@ -247,35 +335,35 @@ function simulateUpload() {
 function capturePhoto() {
     // Fotoğrafın alınacağı ESP32 /capture adresi
     const captureUrl = "http://192.168.0.29/capture";
-    
+
     // ESP32'den veriyi Fetch ile alıp kendi cihazımıza indiriyoruz
     fetch(captureUrl)
-    .then(response => {
-        if (!response.ok) throw new Error("Ağ yanıt vermedi");
-        return response.blob();
-    })
-    .then(blob => {
-        const url = window.URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.style.display = 'none';
-        a.href = url;
-        
-        // Benzersiz dosya adı oluşturma: Örn: Sera_Kamera_2024-03-22T14-30-00.jpg
-        const dateStr = new Date().toISOString().replace(/[:.]/g, '-');
-        a.download = `Sera_Kamera_${dateStr}.jpg`;
-        
-        document.body.appendChild(a);
-        a.click();
-        
-        window.URL.revokeObjectURL(url);
-        addAlert("Fotoğraf Kaydedildi", "Kameradan alınan anlık görüntü başarıyla indirildi.", "success");
-    })
-    .catch(err => {
-        console.warn("Fetch API ile fotoğraf çekilemedi CORS veya ağ hatası:", err);
-        // Fallback: CORS veya başka sebepten dolayı JS ile indiremezsek, fotoğrafı tarayıcıda yeni bir sekmede açıyoruz.
-        addAlert("Bilgi", "İndirme başlatılamadı ancak fotoğraf yeni bir sekmede açılıyor...", "info");
-        window.open(captureUrl, '_blank');
-    });
+        .then(response => {
+            if (!response.ok) throw new Error("Ağ yanıt vermedi");
+            return response.blob();
+        })
+        .then(blob => {
+            const url = window.URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.style.display = 'none';
+            a.href = url;
+
+            // Benzersiz dosya adı oluşturma: Örn: Sera_Kamera_2024-03-22T14-30-00.jpg
+            const dateStr = new Date().toISOString().replace(/[:.]/g, '-');
+            a.download = `Sera_Kamera_${dateStr}.jpg`;
+
+            document.body.appendChild(a);
+            a.click();
+
+            window.URL.revokeObjectURL(url);
+            addAlert("Fotoğraf Kaydedildi", "Kameradan alınan anlık görüntü başarıyla indirildi.", "success");
+        })
+        .catch(err => {
+            console.warn("Fetch API ile fotoğraf çekilemedi CORS veya ağ hatası:", err);
+            // Fallback: CORS veya başka sebepten dolayı JS ile indiremezsek, fotoğrafı tarayıcıda yeni bir sekmede açıyoruz.
+            addAlert("Bilgi", "İndirme başlatılamadı ancak fotoğraf yeni bir sekmede açılıyor...", "info");
+            window.open(captureUrl, '_blank');
+        });
 }
 
 function deleteAlert(btnEl) {
@@ -297,14 +385,14 @@ function clearAllAlerts() {
     }
 }
 
-function addAlert(title, message, type="info", isCritical=false) {
+function addAlert(title, message, type = "info", isCritical = false) {
     const list = document.querySelector('.alert-list');
-    
+
     const alertEl = document.createElement('div');
     alertEl.className = `alert-item ${type} ${isCritical ? 'critical' : ''}`;
-    
+
     const iconClass = type === "warning" || type === "danger" ? "fa-triangle-exclamation" : "fa-info-circle";
-    
+
     alertEl.innerHTML = `
         <i class="fa-solid ${iconClass} alert-icon"></i>
         <div class="alert-content">
@@ -314,11 +402,11 @@ function addAlert(title, message, type="info", isCritical=false) {
         </div>
         <button class="btn-delete-alert" onclick="deleteAlert(this)" title="Sil"><i class="fa-solid fa-times"></i></button>
     `;
-    
+
     list.prepend(alertEl);
-    
+
     // Keep max 10 items
-    if(list.children.length > 10) {
+    if (list.children.length > 10) {
         list.removeChild(list.lastChild);
     }
 }
@@ -338,8 +426,8 @@ function initMQTT() {
         clean: true,
         reconnectPeriod: 2000,
         connectTimeout: 30 * 1000,
-        username: "yunopo42",   
-        password: "Yunus_emre1903", 
+        username: "yunopo42",
+        password: "Yunus_emre1903",
         rejectUnauthorized: false
     };
 
@@ -356,41 +444,68 @@ function initMQTT() {
     client.on('connect', function () {
         console.log("MQTT Sunucusuna Başarıyla Bağlandı!");
         addAlert("Bulut Bağlantısı", "MQTT (WSS) Socket iletişimi sağlandı. (Canlı Veri Bekleniyor)", "success");
-        
-        document.getElementById('led-mqtt').className = "led status-healthy";
-        document.getElementById('led-db').className = "led status-healthy";
-        document.getElementById('led-sensor').className = "led status-healthy";
-        
+
+        document.getElementById('led-mqtt').className = "led green";
+        document.getElementById('led-db').className = "led green";
+        document.getElementById('led-sensor').className = "led green";
+
         // Kanallara abone (Subscribe) ol
         client.subscribe('sera/sensor/#');
-        client.subscribe('sera/control/#');
+        client.subscribe('sera/control/#');  // UI'dan giden komutların geri yankısı
+        client.subscribe('sera/status/#');   // ESP32'den gelen röle durum bildirimleri
         client.subscribe('sera/kamera'); // Resimlere de abone ol
     });
 
     client.on('message', function (topic, message) {
         console.log("MQTT Mesaj Geldi -> Konu:", topic, "Boyut:", message.length);
 
-        // 1. KAMERA GÖRÜNTÜSÜ (Esnek Konu Yakalama)
+        // 1. KAMERA GÖRÜNTÜSÜ
         if (topic === 'sera/kamera' || topic === 'sera/camera') {
             try {
-                const bytes = new Uint8Array(message);
-                let binary = '';
-                const len = bytes.byteLength;
-                for (let i = 0; i < len; i++) {
-                    binary += String.fromCharCode(bytes[i]);
+                console.log("[CAM] Mesaj alindi! Boyut:", message.length, "byte");
+
+                const firstByte = new Uint8Array(message)[0];
+                let base64String;
+
+                if (firstByte === 0xFF) {
+                    // Ham JPEG binary → base64'e çevir
+                    const bytes = new Uint8Array(message);
+                    let binary = '';
+                    for (let i = 0; i < bytes.byteLength; i++) {
+                        binary += String.fromCharCode(bytes[i]);
+                    }
+                    base64String = window.btoa(binary);
+                    console.log("[CAM] Mod: Ham JPEG → base64 cevrimi yapildi");
+                } else {
+                    // Base64 string (ESP32-CAM'den) → direkt al
+                    base64String = message.toString();
+                    console.log("[CAM] Mod: Base64 string alindi");
                 }
-                const base64String = window.btoa(binary);
-                
+
+                // ÖNEMLİ: Arduino base64 kütüphanesi her 76 karakterde \n ekler.
+                // Bu karakterler data URL'yi bozar → görüntü render edilmez.
+                // Tüm whitespace karakterlerini temizle:
+                base64String = base64String.replace(/[\r\n\t ]/g, '');
+
+                console.log("[CAM] Islenen base64 uzunlugu:", base64String.length);
+                console.log("[CAM] Ilk 50 karakter:", base64String.substring(0, 50));
+                // /9j/ ile baslamiyorsa JPEG degil demektir
+                if (!base64String.startsWith('/9j/')) {
+                    console.warn("[CAM] UYARI: Base64 /9j/ ile baslamıyor! Gelen veri JPEG olmayabilir.");
+                }
+
                 const imgEl = document.getElementById('video-stream');
                 if (imgEl) {
+                    imgEl.src = 'data:image/jpeg;base64,' + base64String;
                     imgEl.style.display = 'block';
                     const fallbackEl = document.getElementById('stream-fallback');
                     if (fallbackEl) fallbackEl.style.display = 'none';
-                    imgEl.src = 'data:image/jpeg;base64,' + base64String;
-                    console.log("Kamera görüntüsü başarıyla güncellendi.");
+                    console.log("[CAM] imgEl.src guncellendi. Goruntu yukleniyor...");
+                } else {
+                    console.error("[CAM] HATA: 'video-stream' elementi bulunamadi!");
                 }
-            } catch(e) {
-                console.error("Kamera verisi isleme hatasi:", e);
+            } catch (e) {
+                console.error("[CAM] Kamera verisi isleme hatasi:", e);
             }
             return;
         }
@@ -401,6 +516,8 @@ function initMQTT() {
         const endpoint = parts[2]; // 'sicaklik', 'fan', 'mode' vb.
 
         // 2. MOD VE CİHAZ SENKRONİZASYONU
+        // sera/control/ = UI'dan ESP32'ye giden komutlar (mod degisikligi vs.)
+        // sera/status/  = ESP32'den UI'ya gelen röle durum bildirimleri
         if (category === 'control' || category === 'status') {
             if (endpoint === 'mode') {
                 const overrideEl = document.getElementById('override-toggle');
@@ -413,7 +530,9 @@ function initMQTT() {
                 const isON = (payload === 'ON');
                 const toggleId = `relay-${endpoint}`;
                 const toggleEl = document.getElementById(toggleId);
-                if (toggleEl && toggleEl.checked !== isON) {
+                // Sadece 'status' kanalından gelen bildirimlerle UI'yı güncelle
+                // 'control' kanalından gelen yankiyi yoksay (kendi gönderdiğimiz komut)
+                if (category === 'status' && toggleEl && toggleEl.checked !== isON) {
                     toggleEl.checked = isON;
                     updateRelayUI(toggleId, isON);
                 }
@@ -440,8 +559,8 @@ function updateSensorUI(type, value) {
     if (type === 'sicaklik') {
         document.getElementById('val-temp').innerText = numVal.toFixed(1);
         updateMainChartData(0, numVal); // 0. Dataset Sıcaklık
-        updateCircularProgress('.circular-chart.orange .circle', numVal, 50); 
-    } 
+        updateCircularProgress('.circular-chart.orange .circle', numVal, 50);
+    }
     else if (type === 'nem') {
         document.getElementById('val-hum').innerText = Math.round(numVal);
         updateMainChartData(1, numVal); // 1. Dataset Nem
@@ -449,29 +568,29 @@ function updateSensorUI(type, value) {
     }
     else if (type === 'isik') {
         document.getElementById('val-light').innerText = Math.round(numVal);
-        updateCircularProgress('.circular-chart.yellow .circle', numVal, 4095); 
+        updateCircularProgress('.circular-chart.yellow .circle', numVal, 4095);
     }
     else if (type === 'toprak') {
         const soilEl = document.getElementById('val-soil');
-        if(soilEl) soilEl.innerText = Math.round(numVal);
-        
+        if (soilEl) soilEl.innerText = Math.round(numVal);
+
         // 4095 kuru, 0 çok ıslak. Ters orantı ile nem yüzdesi gibi gösterelim (sadece grafik için)
         // Ya da direkt değeri 4095'e bölerek dolduralım:
         updateCircularProgress('.circular-chart.green .circle', numVal, 4095);
     }
     else if (type === 'yagmur') {
         const rainEl = document.getElementById('val-rain');
-        if(rainEl) rainEl.innerText = Math.round(numVal);
-        
+        if (rainEl) rainEl.innerText = Math.round(numVal);
+
         updateCircularProgress('.circular-chart.cyan .circle', numVal, 4095);
     }
 }
 
 function updateCircularProgress(selector, value, maxVal) {
     const el = document.querySelector(selector);
-    if(el) {
+    if (el) {
         let percent = (value / maxVal) * 100;
-        if(percent > 100) percent = 100;
+        if (percent > 100) percent = 100;
         el.setAttribute('stroke-dasharray', `${percent}, 100`);
     }
 }
@@ -479,7 +598,7 @@ function updateCircularProgress(selector, value, maxVal) {
 function updateControlUI(device, action) {
     const isChecked = (action === 'ON');
     let toggleId = "";
-    
+
     if (device === 'fan') toggleId = 'relay-fan';
     if (device === 'led') toggleId = 'relay-led';
     if (device === 'pump') toggleId = 'relay-pump';
@@ -488,28 +607,33 @@ function updateControlUI(device, action) {
     if (toggleEl) {
         toggleEl.checked = isChecked;
         updateRelayUI(toggleId, isChecked);
-        
+
+        // AI Kararını Supabase'e Yaz (Diğer cihazlara yayılması için)
+        if (supabaseClient && SUPABASE_ANON_KEY !== "BURAYA_SUPABASE_ANON_KEY_GELECEK") {
+            supabaseClient.from('device_states').update({ state: action }).eq('device', device).then();
+        }
+
         const overrideEl = document.getElementById('override-toggle');
-        if(!overrideEl.checked) {
-             addAlert("AI Kararı", `Sistem otonom olarak ${device} donanımını ${action.replace('ON','AÇTI').replace('OFF','KAPATTI')}.`, "info");
+        if (!overrideEl.checked) {
+            addAlert("AI Kararı", `Sistem otonom olarak ${device} donanımını ${action.replace('ON', 'AÇTI').replace('OFF', 'KAPATTI')}.`, "info");
         }
     }
 }
 
 function updateMainChartData(datasetIndex, newValue) {
-    if(!mainChart) return;
+    if (!mainChart) return;
     const dataset = mainChart.data.datasets[datasetIndex];
-    if(dataset.data.length > 20) {
+    if (dataset.data.length > 20) {
         dataset.data.shift(); // Sol baştakini at
-        if(datasetIndex === 0) {  
-             const now = new Date();
-             mainChart.data.labels.shift();
-             mainChart.data.labels.push(`${now.getHours()}:${now.getMinutes().toString().padStart(2, '0')}`);
+        if (datasetIndex === 0) {
+            const now = new Date();
+            mainChart.data.labels.shift();
+            mainChart.data.labels.push(`${now.getHours()}:${now.getMinutes().toString().padStart(2, '0')}`);
         }
     } else {
-        if(datasetIndex === 0) {
-             const now = new Date();
-             mainChart.data.labels.push(`${now.getHours()}:${now.getMinutes().toString().padStart(2, '0')}`);
+        if (datasetIndex === 0) {
+            const now = new Date();
+            mainChart.data.labels.push(`${now.getHours()}:${now.getMinutes().toString().padStart(2, '0')}`);
         }
     }
     dataset.data.push(newValue);
@@ -523,18 +647,25 @@ function setupManualOverridePublishers(client) {
         'relay-pump': 'sera/control/pump'
     };
 
-    for(const id in relays) {
+    for (const id in relays) {
         const toggle = document.getElementById(id);
         const topic = relays[id];
-        
+
         toggle.addEventListener('click', (e) => {
             const overrideMode = document.getElementById('override-toggle').checked;
             if (overrideMode) {
                 const cmd = e.target.checked ? 'ON' : 'OFF';
                 client.publish(topic, cmd, { retain: true });
+
+                // Supabase'e Yaz (Diğer cihazları anında güncellemek için)
+                if (supabaseClient && SUPABASE_ANON_KEY !== "BURAYA_SUPABASE_ANON_KEY_GELECEK") {
+                    const devName = id.replace('relay-', '');
+                    supabaseClient.from('device_states').update({ state: cmd }).eq('device', devName).then();
+                }
+
                 addAlert('Manuel Geçersiz Kılma', `Talebiniz buluta gitti: ${topic} -> ${cmd}`, 'warning');
             } else {
-                e.preventDefault(); 
+                e.preventDefault();
             }
         });
     }
@@ -544,7 +675,7 @@ function toggleTheme() {
     const body = document.body;
     const isLight = body.getAttribute("data-theme") === "light";
     const btnIcon = document.querySelector("#theme-btn i");
-    
+
     if (isLight) {
         body.removeAttribute("data-theme");
         btnIcon.className = "fa-solid fa-moon";
@@ -560,21 +691,21 @@ function updateChartTheme(theme) {
     if (!mainChart) return;
     const textColor = theme === "light" ? "#475569" : "rgba(255, 255, 255, 0.5)";
     const gridColor = theme === "light" ? "rgba(0, 0, 0, 0.05)" : "rgba(255, 255, 255, 0.05)";
-    
+
     // Update axes and legends
     mainChart.options.scales.x.grid.color = gridColor;
     if (!mainChart.options.scales.x.ticks) mainChart.options.scales.x.ticks = {};
     mainChart.options.scales.x.ticks.color = textColor;
-    
+
     mainChart.options.scales.y.grid.color = gridColor;
     if (!mainChart.options.scales.y.ticks) mainChart.options.scales.y.ticks = {};
     mainChart.options.scales.y.ticks.color = textColor;
-    
+
     if (!mainChart.options.scales.y1.ticks) mainChart.options.scales.y1.ticks = {};
     mainChart.options.scales.y1.ticks.color = textColor;
-    
+
     mainChart.options.plugins.legend.labels.color = textColor;
-    
+
     mainChart.update();
 }
 
@@ -582,25 +713,25 @@ function updateChartTheme(theme) {
 // KAMERA KONTROLLERİ (FOTOĞRAF ÇEK / YÜKLE)
 // ==========================================
 // Manuel Analiz Tetikleyici (Butona basıldığında)
-window.runManualAnalysis = function() {
+window.runManualAnalysis = function () {
     const imgEl = document.getElementById('video-stream');
     if (!imgEl || !imgEl.src || imgEl.src.includes('R0lGODlhAQABAIAAAAAAAP')) {
         addAlert("Hata", "Henüz bir görüntü ulaşmadı! Lütfen kameranın bağlanmasını bekleyin.", "danger");
         return;
     }
-    
+
     addAlert("Analiz Başladı", "Görüntü yapay zeka modeline gönderiliyor...", "info");
     predictImage(imgEl);
 }
 
-window.capturePhoto = function() {
+window.capturePhoto = function () {
     const imgEl = document.getElementById('video-stream');
     // Eğer resim henüz yüklenmediyse hata ver:
     if (!imgEl || !imgEl.src || imgEl.src.includes('R0lGODlhAQABAIAAAAAAAP')) {
         alert("Henüz buluttan kamera görüntüsü ulaşmadı! Lütfen bekleyin.");
         return;
     }
-    
+
     // Görüntüyü bilgisayara JPG olarak indirme tetikleyicisi
     const a = document.createElement('a');
     a.href = imgEl.src;
@@ -647,9 +778,9 @@ async function handleImageUpload(event) {
     const imgEl = document.getElementById('video-stream');
     imgEl.src = URL.createObjectURL(file);
     imgEl.style.display = 'block';
-    
+
     const fallbackEl = document.getElementById('stream-fallback');
-    if(fallbackEl) fallbackEl.style.display = 'none';
+    if (fallbackEl) fallbackEl.style.display = 'none';
 
     imgEl.onload = () => {
         predictImage(imgEl);
@@ -670,28 +801,28 @@ async function predictImage(imgElement) {
         alert("Model henüz yüklenmedi veya bulunamadı.");
         return;
     }
-    
+
     try {
         // Görüntüyü tensöre çevirme (MobileNetV2 preprocess)
         let tensor = tf.browser.fromPixels(imgElement)
             .resizeNearestNeighbor([224, 224])
             .toFloat();
-            
+
         // 0-255'i 0-1 aralığına çek (ImageDataGenerator rescale=1./255 ile uyumlu)
         tensor = tensor.div(tf.scalar(255.0));
-        tensor = tensor.expandDims(0); 
-        
+        tensor = tensor.expandDims(0);
+
         const predictions = await tfModel.predict(tensor).data();
-        
+
         const maxProb = Math.max(...predictions);
         const classIdx = predictions.indexOf(maxProb);
         const result = DISEASE_CLASSES[classIdx];
         const confidence = (maxProb * 100).toFixed(1);
-        
+
         document.getElementById('ai-confidence').textContent = `${confidence}%`;
         const fillEl = document.querySelector('.progress-bar-fill');
         if (fillEl) fillEl.style.width = `${confidence}%`;
-        
+
         const statusEl = document.getElementById('ai-status');
         if (classIdx === 9) { // Healthy
             statusEl.className = "status-badge status-healthy";
@@ -700,23 +831,29 @@ async function predictImage(imgElement) {
             statusEl.innerHTML = `<i class="fa-solid fa-check-circle"></i> <span>${result.name}</span>`;
             addAlert("Analiz Sonucu: Sağlıklı", result.treatment, "success");
         } else {
-            statusEl.className = "status-badge"; 
+            statusEl.className = "status-badge";
             statusEl.style.background = "rgba(248, 113, 113, 0.1)"; // Red
             statusEl.style.color = "#f87171";
             statusEl.innerHTML = `<i class="fa-solid fa-triangle-exclamation"></i> <span>${result.name}</span>`;
             addAlert(`Hastalık Tespit Edildi: ${result.name}`, `Doğruluk: %${confidence}. Öneri: ${result.treatment}`, "danger", true);
-            
+
             // Eğer Geç Yanıklık veya Erken Yanıklık veya Yaprak Küfü ise havalandırmayı çalıştır
             const overrideMode = document.getElementById('override-toggle')?.checked;
             if (!overrideMode && (classIdx === 1 || classIdx === 2 || classIdx === 3)) {
-                 fetch(`http://${ESP_IP}/api/control?device=fan&state=ON`).catch(e=>console.log(e));
-                 addAlert("Otonom Karar", "Hastalık riski nedeniyle fan sistemi (havalandırma) otomatik olarak çalıştırıldı.", "warning");
-                 updateRelayUI('relay-fan', true);
-                 const toggleEl = document.getElementById('relay-fan');
-                 if(toggleEl) toggleEl.checked = true;
+                if (!window.isCloudEnvironment) {
+                    fetch(`http://${ESP_IP}/api/control?device=fan&state=ON`).catch(e => console.log(e));
+                }
+                // MQTT üzerinden de gönder
+                if (window.mqttClient) {
+                    window.mqttClient.publish('sera/control/fan', 'ON', { retain: true });
+                }
+                addAlert("Otonom Karar", "Hastalık riski nedeniyle fan sistemi (havalandırma) otomatik olarak çalıştırıldı.", "warning");
+                updateRelayUI('relay-fan', true);
+                const toggleEl = document.getElementById('relay-fan');
+                if (toggleEl) toggleEl.checked = true;
             }
         }
-        
+
         // Veritabanı ve Veri Madenciliği İçin Backend'e Gönder (Resim Dahil)
         try {
             const canvas = document.createElement("canvas");
@@ -724,18 +861,18 @@ async function predictImage(imgElement) {
             const MAX_SIZE = 640;
             let width = imgElement.naturalWidth || imgElement.width || 224;
             let height = imgElement.naturalHeight || imgElement.height || 224;
-            
+
             if (width > MAX_SIZE) {
                 height *= MAX_SIZE / width;
                 width = MAX_SIZE;
             }
-            
+
             canvas.width = width;
             canvas.height = height;
             const ctx = canvas.getContext("2d");
             ctx.drawImage(imgElement, 0, 0, width, height);
             const base64Image = canvas.toDataURL("image/jpeg", 0.6); // Kaliteyi %60 yaparak boyutu iyice düşür
-            
+
             fetch('https://otonom-sera-365.onrender.com/api/ai-log', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -746,10 +883,10 @@ async function predictImage(imgElement) {
                     base64Image: base64Image
                 })
             }).catch(e => console.log("AI Log gönderilemedi:", e));
-        } catch(e) {
+        } catch (e) {
             console.error("Resim çevrilirken hata:", e);
         }
-        
+
     } catch (error) {
         console.error("Tahmin sırasında hata:", error);
     }
@@ -760,7 +897,7 @@ async function predictImage(imgElement) {
 // -------------------------
 function fetchAnalytics() {
     const icon = document.querySelector('.analytics-header .fa-sync');
-    if(icon) icon.classList.add('fa-spin');
+    if (icon) icon.classList.add('fa-spin');
 
     fetch('https://otonom-sera-365.onrender.com/api/analytics')
         .then(res => res.json())
@@ -772,7 +909,7 @@ function fetchAnalytics() {
             document.getElementById('stat-avg-temp').textContent = `${data.average_temperature} °C`;
             document.getElementById('stat-avg-hum').textContent = `${data.average_humidity} %`;
             document.getElementById('stat-insight').textContent = data.insight;
-            
+
             // Endüstriyel Metrikleri Güncelle
             if (data.industrial_metrics) {
                 document.getElementById('ind-energy').textContent = data.industrial_metrics.total_energy_kwh;
@@ -783,15 +920,15 @@ function fetchAnalytics() {
 
             // Veritabanı bağlı LED'ini yak
             const dbLed = document.getElementById('led-db');
-            if(dbLed) dbLed.className = "led status-healthy";
+            if (dbLed) dbLed.className = "led green";
         })
         .catch(err => {
             console.error("Analiz verisi alınamadı:", err);
             const dbLed = document.getElementById('led-db');
-            if(dbLed) dbLed.className = "led"; // Hata durumunda griye çek
+            if (dbLed) dbLed.className = "led"; // Hata durumunda griye çek
         })
         .finally(() => {
-            if(icon) icon.classList.remove('fa-spin');
+            if (icon) icon.classList.remove('fa-spin');
         });
 }
 
@@ -801,11 +938,11 @@ function fetchAnalytics() {
 function initLocalESP32() {
     console.log(`Yerel ESP32 cihazına bağlanılıyor: http://${ESP_IP}`);
     addAlert("Yerel Bağlantı", `ESP32 (${ESP_IP}) üzerinden veri bekleniyor...`, "info");
-    
-    document.getElementById('led-sensor').className = "led status-healthy";
+
+    document.getElementById('led-sensor').className = "led green";
     document.getElementById('led-mqtt').className = "led"; // MQTT Pasif
     document.getElementById('led-db').className = "led";   // DB pasif
-    
+
     // Her 2 saniyede bir verileri çek (Polling)
     setInterval(() => {
         fetch(`http://${ESP_IP}/api/data`)
@@ -817,7 +954,7 @@ function initLocalESP32() {
                 updateSensorUI('isik', data.ldr);
                 updateSensorUI('toprak', data.soil);
                 updateSensorUI('yagmur', data.rain);
-                
+
                 // Röle durumlarını otonom moddayken web'e yansıtma (manuel moddaysa Web tabanlı karar geçerlidir)
                 const overrideMode = document.getElementById('override-toggle').checked;
                 if (!overrideMode) {
@@ -825,7 +962,7 @@ function initLocalESP32() {
                     updateControlUI('led', data.light ? 'ON' : 'OFF');
                     updateControlUI('pump', data.pump ? 'ON' : 'OFF');
                     updateControlUI('fan', data.fan ? 'ON' : 'OFF');
-                    
+
                     // OTONOM ZEKAYI ÇALIŞTIR
                     runAutonomousLogic(data);
                 }
@@ -834,7 +971,7 @@ function initLocalESP32() {
                 console.warn("ESP32 API Bekleyişi... Lütfen cihaz bağlantısını kontrol edin.");
             });
     }, 2000);
-    
+
     // Buton eventlerini HTTP için ayarla
     setupLocalManualOverride();
 }
@@ -846,10 +983,10 @@ function setupLocalManualOverride() {
         'relay-pump': 'pump'
     };
 
-    for(const id in relays) {
+    for (const id in relays) {
         const toggle = document.getElementById(id);
         const device = relays[id];
-        
+
         // Önceki event listenerların çakışmaması için basit kontrol
         toggle.addEventListener('click', (e) => {
             const overrideMode = document.getElementById('override-toggle').checked;
@@ -861,10 +998,10 @@ function setupLocalManualOverride() {
                     })
                     .catch(err => {
                         addAlert('Bağlantı Hatası', `Komut iletilemedi. Lütfen cihazı kontrol edin.`, 'danger');
-                        e.preventDefault(); 
+                        e.preventDefault();
                     });
             } else {
-                e.preventDefault(); 
+                e.preventDefault();
             }
         });
     }
@@ -896,24 +1033,24 @@ function runAutonomousLogic(data) {
     // 2. KURAL: TOPRAK NEMİ KONTROLÜ (Kapasitif Sensör genelde >3000 Kuru, <2000 Islak)
     // Değerler kullandığınız sensörün kalibrasyonuna göre değişebilir.
     if (data.soil > 3000 && data.pump === false) {
-         setRelayAutonomous('pump', 'ON');
-         addAlert("Toprak Kurudu", `Nem seviyesi kritik (${data.soil}). Su Pompası devreye alındı.`, "warning");
-         actionTaken = true;
+        setRelayAutonomous('pump', 'ON');
+        addAlert("Toprak Kurudu", `Nem seviyesi kritik (${data.soil}). Su Pompası devreye alındı.`, "warning");
+        actionTaken = true;
     } else if (data.soil < 2000 && data.pump === true) {
-         setRelayAutonomous('pump', 'OFF');
-         addAlert("Yeterli Sulama", "Toprak neme doydu. Pompa durduruldu.", "info");
-         actionTaken = true;
+        setRelayAutonomous('pump', 'OFF');
+        addAlert("Yeterli Sulama", "Toprak neme doydu. Pompa durduruldu.", "info");
+        actionTaken = true;
     }
 
     // 3. KURAL: IŞIK ŞİDDETİ (LDR < 1000 Karanlık, > 2000 Aydınlık vs.)
     if (data.ldr < 1000 && data.light === false) {
-         setRelayAutonomous('led', 'ON');
-         addAlert("Güneş Yetersiz", "Sera karanlık. Fotosentez için Grow LED açıldı.", "info");
-         actionTaken = true;
+        setRelayAutonomous('led', 'ON');
+        addAlert("Güneş Yetersiz", "Sera karanlık. Fotosentez için Grow LED açıldı.", "info");
+        actionTaken = true;
     } else if (data.ldr >= 1500 && data.light === true) {
-         setRelayAutonomous('led', 'OFF');
-         addAlert("Yeterli Gün Işığı", "Grow LED kapatıldı, enerji tasarrufu sağlanıyor.", "info");
-         actionTaken = true;
+        setRelayAutonomous('led', 'OFF');
+        addAlert("Yeterli Gün Işığı", "Grow LED kapatıldı, enerji tasarrufu sağlanıyor.", "info");
+        actionTaken = true;
     }
 
     if (actionTaken) {

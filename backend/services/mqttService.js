@@ -25,6 +25,9 @@ function init() {
         console.log('[MQTT] Başarıyla HiveMQ Cloud\'a bağlandı!');
         
         // Sensör, durum ve kontrol (manuel) konularına abone oluyoruz
+        // sera/control/ = UI'dan ESP32'ye giden komutlar
+        // sera/status/  = ESP32'den gelen röle durum bildirimleri (control ile çakışmıyor)
+        // sera/sensor/  = ESP32'den gelen sensör verileri
         client.subscribe(['sera/sensor/#', 'sera/status/#', 'sera/control/#'], (err) => {
             if (!err) {
                 console.log('[MQTT] "sera/#" konularına (sensor, status, control) abone olundu.');

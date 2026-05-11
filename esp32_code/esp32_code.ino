@@ -1,13 +1,40 @@
+/*
+ * SeraPro 360 AI - Ana ESP32 Kodu (MQTT + HTTP)
+ *
+ * Özellikler:
+ *  - Sensör verilerini MQTT üzerinden buluta gönderir
+ *  - Netlify'dan gelen MQTT komutlarıyla röleleri tetikler
+ *  - Aynı ağdaki cihazlar için HTTP API'yi korur
+ *  - OLED ekrana anlık verileri yazar
+ *
+ * Gerekli Kütüphaneler (Arduino IDE > Tools > Manage Libraries):
+ *  - PubSubClient (Nick O'Leary)
+ *  - Adafruit SSD1306
+ *  - Adafruit GFX Library
+ *  - DHT sensor library (Adafruit)
+ */
+
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <DHT.h>
+#include <PubSubClient.h>
 #include <WebServer.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <Wire.h>
 
-// --- Wi-Fi Bilgileri ---
-const char *ssid = "Xiaomi15";
-const char *password = "........";
+// ============================================================
+//  AYARLAR - BURAYA KENDİ BİLGİLERİNİZİ YAZIN
+// ============================================================
+const char *ssid = "Xiaomi15";     // Wi-Fi Adı
+const char *password = "........"; // Wi-Fi Şifresi
+
+// HiveMQ Cloud Bilgileri
+const char *mqttHost = "ce79181754684d63abefda7c38d3a25f.s1.eu.hivemq.cloud";
+const int mqttPort = 8883; // TLS Portu
+const char *mqttUser = "yunopo42";
+const char *mqttPassword = "Yunus_emre1903";
+// ============================================================
 
 // --- Ekran Ayarları ---
 #define SCREEN_WIDTH 128
@@ -24,25 +51,124 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 #define PUMP_RELAY 19
 #define FAN_PIN 23
 
-bool lightState = false, pumpState = false, fanState = false;
 #define RELAY_ON LOW
 #define RELAY_OFF HIGH
+
+bool lightState = false, pumpState = false, fanState = false;
 
 DHT dht(DHTPIN, DHTTYPE);
 WebServer server(80);
 
+WiFiClientSecure wifiSecure;
+PubSubClient mqttClient(wifiSecure);
+
+unsigned long lastMqttPublish = 0;
+const long publishInterval = 3000; // 3 saniyede bir sensör verisi gönder
+
+// ============================================================
+//  MQTT: Gelen Komutları İşle (Netlify'dan gelen buton tıklamaları)
+// ============================================================
+void mqttCallback(char *topic, byte *payload, unsigned int length) {
+  String topicStr = String(topic);
+  String msg = "";
+  for (unsigned int i = 0; i < length; i++) {
+    msg += (char)payload[i];
+  }
+
+  Serial.print("MQTT Mesaj Alındı [");
+  Serial.print(topicStr);
+  Serial.print("] -> ");
+  Serial.println(msg);
+
+  bool isON = (msg == "ON");
+
+  if (topicStr == "sera/control/fan") {
+    fanState = isON;
+    digitalWrite(FAN_PIN, fanState ? HIGH : LOW);
+    Serial.println(fanState ? "Fan AÇILDI" : "Fan KAPANDI");
+  } else if (topicStr == "sera/control/pump") {
+    pumpState = isON;
+    digitalWrite(PUMP_RELAY, pumpState ? RELAY_ON : RELAY_OFF);
+    Serial.println(pumpState ? "Pompa AÇILDI" : "Pompa KAPANDI");
+  } else if (topicStr == "sera/control/led") {
+    lightState = isON;
+    digitalWrite(LIGHT_RELAY, lightState ? RELAY_ON : RELAY_OFF);
+    Serial.println(lightState ? "Işık AÇILDI" : "Işık KAPANDI");
+  }
+}
+
+// ============================================================
+//  MQTT: Bağlan / Yeniden Bağlan
+// ============================================================
+void reconnectMQTT() {
+  // Bağlı değilse bağlanmayı dene
+  while (!mqttClient.connected()) {
+    Serial.print("MQTT Bağlanılıyor...");
+    String clientId = "ESP32_Sera_" + String(random(0xffff), HEX);
+
+    if (mqttClient.connect(clientId.c_str(), mqttUser, mqttPassword)) {
+      Serial.println(" Bağlandı!");
+
+      // Kontrol kanallarına abone ol (Netlify'dan gelen komutlar)
+      mqttClient.subscribe("sera/control/fan");
+      mqttClient.subscribe("sera/control/pump");
+      mqttClient.subscribe("sera/control/led");
+
+      Serial.println("Kontrol kanallarına abone olundu.");
+    } else {
+      Serial.print("Başarısız, rc=");
+      Serial.print(mqttClient.state());
+      Serial.println(" -> 5 saniye sonra tekrar denenecek.");
+      delay(5000);
+    }
+  }
+}
+
+// ============================================================
+//  MQTT: Sensör Verilerini Yayınla
+// ============================================================
+void publishSensorData() {
+  float t = dht.readTemperature();
+  float h = dht.readHumidity();
+  int ldr = analogRead(LDR_PIN);
+  int soil = analogRead(SOIL_PIN);
+  int rain = analogRead(RAIN_PIN);
+
+  // Her sensörü ayrı konuya gönder (app.js updateSensorUI ile uyumlu)
+  if (!isnan(t))
+    mqttClient.publish("sera/sensor/sicaklik", String(t, 1).c_str(), true);
+  if (!isnan(h))
+    mqttClient.publish("sera/sensor/nem", String(h, 0).c_str(), true);
+  mqttClient.publish("sera/sensor/isik", String(ldr).c_str(), true);
+  mqttClient.publish("sera/sensor/toprak", String(soil).c_str(), true);
+  mqttClient.publish("sera/sensor/yagmur", String(rain).c_str(), true);
+
+  // Röle durumlarını AYRI bir topic'e yayınla (sera/status/)
+  // NOT: sera/control/ topic'ine YAYINLAMAYINiz! Orası sadece UI'dan ESP32'ye
+  // gelen komutlar içindir. Buraya publish yapılırsa, UI'dan gelen komutlar
+  // ezilir ve fan/pompa açıp kapanamaz hale gelir.
+  mqttClient.publish("sera/status/fan", fanState ? "ON" : "OFF", true);
+  mqttClient.publish("sera/status/pump", pumpState ? "ON" : "OFF", true);
+  mqttClient.publish("sera/status/led", lightState ? "ON" : "OFF", true);
+
+  Serial.println("Sensör verileri MQTT'ye gönderildi.");
+  updateOLED(t, h, ldr, soil, rain);
+}
+
+// ============================================================
+//  OLED Ekran Güncelle
+// ============================================================
 void updateOLED(float t, float h, int ldr, int soil, int rain) {
   display.clearDisplay();
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
-
   display.setCursor(0, 0);
   display.println("     SERA DURUM     ");
   display.println("--------------------");
 
-  if (isnan(t)) {
+  if (isnan(t))
     display.println("Sicaklik: HATA");
-  } else {
+  else {
     display.print("Sicaklik: ");
     display.print(t, 1);
     display.println(" C");
@@ -56,93 +182,90 @@ void updateOLED(float t, float h, int ldr, int soil, int rain) {
   display.println(soil);
   display.print("Yagmur  : ");
   display.println(rain);
-
   display.println("--------------------");
   display.print("F:");
   display.print(fanState ? "ON" : "OFF");
-  display.print(" | L:");
+  display.print(" L:");
   display.print(lightState ? "ON" : "OFF");
-  display.print(" | P:");
+  display.print(" P:");
   display.println(pumpState ? "ON" : "OFF");
   display.display();
 }
 
-String getHTML() {
+// ============================================================
+//  HTTP API: JSON Veri (/api/data)
+// ============================================================
+void handleApiData() {
   float t = dht.readTemperature();
   float h = dht.readHumidity();
   int ldr = analogRead(LDR_PIN);
   int soil = analogRead(SOIL_PIN);
   int rain = analogRead(RAIN_PIN);
 
-  updateOLED(t, h, ldr, soil, rain);
+  String json = "{";
+  json += "\"temp\":" + String(isnan(t) ? 0 : t) + ",";
+  json += "\"hum\":" + String(isnan(h) ? 0 : h) + ",";
+  json += "\"ldr\":" + String(ldr) + ",";
+  json += "\"soil\":" + String(soil) + ",";
+  json += "\"rain\":" + String(rain) + ",";
+  json += "\"light\":" + String(lightState ? "true" : "false") + ",";
+  json += "\"pump\":" + String(pumpState ? "true" : "false") + ",";
+  json += "\"fan\":" + String(fanState ? "true" : "false");
+  json += "}";
 
-  String ptr =
-      "<!DOCTYPE html><html><head><meta charset='UTF-8'><meta name='viewport' "
-      "content='width=device-width, initial-scale=1.0'>";
-  ptr += "<title>Sera Pro Kontrol</title><style>";
-  ptr += "body{font-family:sans-serif; text-align:center; background:#f0f2f5; "
-         "margin:0; padding:20px;}";
-  ptr += ".container{max-width:400px; margin:auto;}";
-  ptr += ".card{background:white; padding:20px; margin-bottom:15px; "
-         "border-radius:15px; box-shadow:0 4px 6px rgba(0,0,0,0.1);}";
-  ptr += "h2{color:#1a73e8;} .val{font-weight:bold; color:#5f6368;}";
-  ptr += ".btn{display:block; width:100%; padding:15px; font-size:18px; "
-         "cursor:pointer; color:white; border:none; border-radius:10px; "
-         "margin:10px 0;}";
-  ptr += ".on{background:#34a853;} .off{background:#ea4335;} "
-         ".refresh{background:#1a73e8;}";
-  ptr += "</style></head><body><div class='container'>";
-  ptr += "<h2>Sera Pro Paneli</h2>";
-
-  // Tüm Sensör Verileri
-  ptr += "<div class='card'><h3>Sensörler</h3>";
-  ptr += "<p>Sıcaklık: <span class='val'>" +
-         (isnan(t) ? "HATA" : String(t) + " °C") + "</span></p>";
-  ptr += "<p>Nem: <span class='val'>%" + (isnan(h) ? "HATA" : String(h)) +
-         "</span></p>";
-  ptr += "<p>Işık (LDR): <span class='val'>" + String(ldr) + "</span></p>";
-  ptr += "<p>Toprak Nemi: <span class='val'>" + String(soil) + "</span></p>";
-  ptr += "<p>Yağmur: <span class='val'>" + String(rain) + "</span></p>";
-  ptr += "</div>";
-
-  // Kontrol Butonları
-  ptr += "<div class='card'><h3>Kontrol</h3>";
-  ptr += "<a href='/toggle/light'><button class='btn " +
-         String(lightState ? "on" : "off") +
-         "'>Mor Işık: " + String(lightState ? "AÇIK" : "KAPALI") +
-         "</button></a>";
-  ptr += "<a href='/toggle/pump'><button class='btn " +
-         String(pumpState ? "on" : "off") +
-         "'>Su Pompası: " + String(pumpState ? "AÇIK" : "KAPALI") +
-         "</button></a>";
-  ptr += "<a href='/toggle/fan'><button class='btn " +
-         String(fanState ? "on" : "off") +
-         "'>Fan: " + String(fanState ? "AÇIK" : "KAPALI") + "</button></a>";
-  ptr += "<a href='/'><button class='btn refresh'>Verileri Yenile</button></a>";
-  ptr += "</div></div></body></html>";
-  return ptr;
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send(200, "application/json", json);
 }
 
+// ============================================================
+//  HTTP API: Röle Kontrol (/api/control?device=fan&state=ON)
+// ============================================================
+void handleApiControl() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  if (server.hasArg("device") && server.hasArg("state")) {
+    String device = server.arg("device");
+    String state = server.arg("state");
+    bool on = (state == "ON" || state == "true");
+
+    if (device == "light" || device == "led") {
+      lightState = on;
+      digitalWrite(LIGHT_RELAY, lightState ? RELAY_ON : RELAY_OFF);
+    } else if (device == "pump") {
+      pumpState = on;
+      digitalWrite(PUMP_RELAY, pumpState ? RELAY_ON : RELAY_OFF);
+    } else if (device == "fan") {
+      fanState = on;
+      digitalWrite(FAN_PIN, fanState ? HIGH : LOW);
+    }
+    server.send(200, "text/plain", "OK");
+  } else {
+    server.send(400, "text/plain",
+                "Bad Request: 'device' ve 'state' parametreleri gerekli");
+  }
+}
+
+// ============================================================
+//  SETUP
+// ============================================================
 void setup() {
   Serial.begin(115200);
   dht.begin();
 
+  // OLED Başlat
   if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
     Serial.println("OLED Hatası!");
   }
-
-  // --- AÇILIŞ EKRANI (SPLASH SCREEN) ---
   display.clearDisplay();
   display.setTextSize(2);
   display.setTextColor(SSD1306_WHITE);
-  display.setCursor(15, 20);
+  display.setCursor(10, 10);
   display.println("SERA PRO");
   display.setTextSize(1);
-  display.setCursor(25, 45);
-  display.println("Sistem Aciliyor...");
+  display.setCursor(15, 40);
+  display.println("Baglaniyor...");
   display.display();
-  delay(3000); // 3 saniye bekle
 
+  // Pinleri Ayarla
   pinMode(LIGHT_RELAY, OUTPUT);
   pinMode(PUMP_RELAY, OUTPUT);
   pinMode(FAN_PIN, OUTPUT);
@@ -150,67 +273,44 @@ void setup() {
   digitalWrite(PUMP_RELAY, RELAY_OFF);
   digitalWrite(FAN_PIN, LOW);
 
+  // Wi-Fi'ye Bağlan
   WiFi.begin(ssid, password);
+  Serial.print("Wi-Fi bağlanıyor");
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
+    Serial.print(".");
   }
   Serial.println();
-  Serial.print("WiFi Baglandi! IP Adresi: ");
+  Serial.print("Bağlandı! IP: ");
   Serial.println(WiFi.localIP());
-  server.on("/", []() { server.send(200, "text/html", getHTML()); });
-  
-  // --- JSON VERİ APİSİ (Web Arayüzü İçin) ---
-  server.on("/api/data", HTTP_GET, []() {
-    float t = dht.readTemperature();
-    float h = dht.readHumidity();
-    int ldr = analogRead(LDR_PIN);
-    int soil = analogRead(SOIL_PIN);
-    int rain = analogRead(RAIN_PIN);
-    
-    String json = "{";
-    json += "\"temp\":" + String(isnan(t) ? 0 : t) + ",";
-    json += "\"hum\":" + String(isnan(h) ? 0 : h) + ",";
-    json += "\"ldr\":" + String(ldr) + ",";
-    json += "\"soil\":" + String(soil) + ",";
-    json += "\"rain\":" + String(rain) + ",";
-    json += "\"light\":" + String(lightState ? "true" : "false") + ",";
-    json += "\"pump\":" + String(pumpState ? "true" : "false") + ",";
-    json += "\"fan\":" + String(fanState ? "true" : "false");
-    json += "}";
-    
-    server.sendHeader("Access-Control-Allow-Origin", "*");
-    server.send(200, "application/json", json);
-  });
 
-  // --- KONTROL APİSİ (Web Arayüzü İçin) ---
-  server.on("/api/control", HTTP_GET, []() {
-    server.sendHeader("Access-Control-Allow-Origin", "*");
-    if (server.hasArg("device") && server.hasArg("state")) {
-      String device = server.arg("device");
-      String state = server.arg("state");
-      bool on = (state == "ON" || state == "true");
-      
-      if (device == "light" || device == "led") {
-        lightState = on;
-        digitalWrite(LIGHT_RELAY, lightState ? RELAY_ON : RELAY_OFF);
-      } else if (device == "pump") {
-        pumpState = on;
-        digitalWrite(PUMP_RELAY, pumpState ? RELAY_ON : RELAY_OFF);
-      } else if (device == "fan") {
-        fanState = on;
-        digitalWrite(FAN_PIN, fanState ? HIGH : LOW);
-      }
-      server.send(200, "text/plain", "OK");
-    } else {
-      server.send(400, "text/plain", "Bad Request");
-    }
-  });
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.println("Wi-Fi Baglandi!");
+  display.print("IP: ");
+  display.println(WiFi.localIP());
+  display.display();
+  delay(2000);
 
-  // CORS Preflight
+  // MQTT Ayarla (TLS - Sertifika doğrulaması kapalı, HiveMQ Cloud Free ile
+  // uyumlu)
+  wifiSecure.setInsecure();
+  mqttClient.setServer(mqttHost, mqttPort);
+  mqttClient.setCallback(mqttCallback);
+  mqttClient.setBufferSize(1024); // Büyük mesajlar için
+
+  // HTTP Sunucu Rotaları
+  server.on("/api/data", HTTP_GET, handleApiData);
+  server.on("/api/control", HTTP_GET, handleApiControl);
+  server.on("/", []() {
+    server.send(200, "text/plain",
+                "SeraPro ESP32 Aktif! IP: " + WiFi.localIP().toString());
+  });
   server.onNotFound([]() {
     if (server.method() == HTTP_OPTIONS) {
       server.sendHeader("Access-Control-Allow-Origin", "*");
-      server.sendHeader("Access-Control-Allow-Methods", "GET, OPTIONS, POST");
+      server.sendHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
       server.sendHeader("Access-Control-Allow-Headers", "*");
       server.send(204);
     } else {
@@ -218,35 +318,27 @@ void setup() {
       server.send(404, "text/plain", "Not Found");
     }
   });
-
-  // --- HTML KONTROL ROTALARI ---
-  server.on("/toggle/light", []() {
-    lightState = !lightState;
-    digitalWrite(LIGHT_RELAY, lightState ? RELAY_ON : RELAY_OFF);
-    server.sendHeader("Location", "/");
-    server.send(303);
-  });
-  server.on("/toggle/pump", []() {
-    pumpState = !pumpState;
-    digitalWrite(PUMP_RELAY, pumpState ? RELAY_ON : RELAY_OFF);
-    server.sendHeader("Location", "/");
-    server.send(303);
-  });
-  server.on("/toggle/fan", []() {
-    fanState = !fanState;
-    digitalWrite(FAN_PIN, fanState ? HIGH : LOW);
-    server.sendHeader("Location", "/");
-    server.send(303);
-  });
   server.begin();
+  Serial.println("HTTP Sunucu Başlatıldı.");
 }
 
+// ============================================================
+//  LOOP
+// ============================================================
 void loop() {
+  // HTTP İsteklerini Yanıtla
   server.handleClient();
-  static unsigned long lastUpdate = 0;
-  if (millis() - lastUpdate > 2000) {
-    lastUpdate = millis();
-    updateOLED(dht.readTemperature(), dht.readHumidity(), analogRead(LDR_PIN),
-               analogRead(SOIL_PIN), analogRead(RAIN_PIN));
+
+  // MQTT Bağlantısını Koru
+  if (!mqttClient.connected()) {
+    reconnectMQTT();
+  }
+  mqttClient.loop();
+
+  // Belirli aralıklarla sensör verilerini MQTT'ye gönder
+  unsigned long now = millis();
+  if (now - lastMqttPublish > publishInterval) {
+    lastMqttPublish = now;
+    publishSensorData();
   }
 }
